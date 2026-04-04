@@ -1,0 +1,21 @@
+[2026-04-02 11:16:46] FAMILY: dr amrita parashar (conf: 0.97) - 
+[2026-04-02 12:00:50] UNKNOWN: Unknown Person (conf: 0.90) - 
+[2026-04-04 14:30:01] FAMILY: shivam (conf: 0.99) - 
+[2026-04-04 14:30:10] FAMILY: shivam (conf: 1.00) - 
+[2026-04-04 14:42:52] UNKNOWN: Unknown Person (conf: 0.98) - 
+[2026-04-04 14:53:37] FAMILY: vaibhav (conf: 0.97) - 
+[2026-04-04 14:53:37] FAMILY: shivammishra (conf: 0.97) - 
+[2026-04-04 14:53:56] UNKNOWN: No Face (conf: 0.00) - No face detected
+[2026-04-04 14:53:58] FAMILY: shivammishra (conf: 1.00) - 
+[2026-04-04 14:54:05] FAMILY: vaibhav (conf: 1.00) - 
+[2026-04-04 14:54:10] UNKNOWN: Unknown Person (conf: 0.94) - 
+[2026-04-04 14:54:15] UNKNOWN: Unknown Person (conf: 0.94) - 
+[2026-04-04 14:54:21] UNKNOWN: Unknown Person (conf: 0.93) - 
+[2026-04-04 14:54:26] UNKNOWN: Unknown Person (conf: 0.95) - 
+[2026-04-04 14:54:31] UNKNOWN: No Face (conf: 0.00) - No face detected
+[2026-04-04 14:54:33] FAMILY: vaibhav (conf: 1.00) - 
+[2026-04-04 14:55:06] FAMILY: shivammishra (conf: 0.99) - 
+[2026-04-04 14:55:11] UNKNOWN: No Face (conf: 0.00) - No face detected
+[2026-04-04 14:55:12] UNKNOWN: Unknown Person (conf: 0.85) - 
+[2026-04-04 14:55:18] FAMILY: dr amrita parashar (conf: 0.97) - 
+[2026-04-04 14:55:26] FAMILY: vaibhav (conf: 0.99) - 
