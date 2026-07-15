@@ -285,6 +285,11 @@ class FacialEngine:
                 reps = DeepFace.represent(
                     img_path=face_img,
                     model_name=self.model_name,
+                    # We already located the face via MediaPipe (detector_backend
+                    # "skip" tells DeepFace not to re-detect), but doorbell-angle
+                    # crops are often partial/off-axis. enforce_detection=False
+                    # keeps DeepFace from raising on those instead of crashing
+                    # the whole /detect request over one bad frame.
                     enforce_detection=False,
                     detector_backend="skip",
                 )

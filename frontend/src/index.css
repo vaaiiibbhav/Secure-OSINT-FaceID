@@ -1,12 +1,65 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+
+  /* Base surface scale */
+  --color-surface-0: #030507;
+  --color-surface-1: #0a0e14;
+  --color-surface-2: #10161f;
+  --color-surface-3: #1a212c;
+
+  /* Brand */
+  --color-brand-400: #22d3ee;
+  --color-brand-500: #06b6d4;
+
+  /* Status */
+  --color-status-known: #34d399;
+  --color-status-unknown: #fb923c;
+  --color-status-spoof: #f87171;
+  --color-status-pending: #a78bfa;
+}
+
+html {
+  color-scheme: dark;
+}
 
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
+  background: var(--color-surface-0);
+  color: #e6edf3;
+  font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* Thin, unobtrusive scrollbars for the dense data panels */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2a323e transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2a323e;
+  border-radius: 999px;
+}
+
+@keyframes scan-line {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100%); }
+}
+.animate-scan-line {
+  animation: scan-line 2.4s linear infinite;
+}
+
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 currentColor; opacity: 0.6; }
+  100% { box-shadow: 0 0 0 14px transparent; opacity: 0; }
+}
+.animate-pulse-ring {
+  animation: pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }

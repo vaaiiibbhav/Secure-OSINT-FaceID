@@ -20,13 +20,15 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -35,6 +37,14 @@ from scraper import OSINTScraper
 
 DATA_DIR = Path("family_data")
 LOG_FILE = DATA_DIR / "logs" / "activity_log.json"
+PENDING_REVIEW_DIR = DATA_DIR / "pending_review"
+
+# The live-feed panel polls /detect frequently (roughly once a second), which
+# would otherwise flood the activity log and re-queue the same visitor for
+# OSINT review on every single frame. These cooldowns debounce that per
+# "who" (a known member's name, or the single shared "unknown" bucket).
+KNOWN_LOG_COOLDOWN_SECONDS = 15.0
+UNKNOWN_OSINT_COOLDOWN_SECONDS = 20.0
 
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +96,9 @@ async def lifespan(app: FastAPI):
     # Startup: build the heavy vision engine once and reuse it.
     state["engine"] = FacialEngine(data_dir=str(DATA_DIR))
     state["logger"] = ActivityLogger()
+    state["cooldowns"] = {}  # "known:<name>" | "unknown" -> last-trigger unix ts
+    state["osint_queue"] = {}  # event_id -> {status, timestamp, frame_path, results}
+    PENDING_REVIEW_DIR.mkdir(parents=True, exist_ok=True)
     print("[main] Secure-OSINT-FaceID API ready.")
     yield
     # Shutdown: release MediaPipe/OpenCV handles.
@@ -130,6 +143,37 @@ def logger() -> ActivityLogger:
     return state["logger"]
 
 
+def _cooldown_ready(key: str, window_seconds: float) -> bool:
+    """True (and resets the clock) if `key` hasn't fired within `window_seconds`."""
+    now = time.monotonic()
+    last = state["cooldowns"].get(key, 0.0)
+    if now - last < window_seconds:
+        return False
+    state["cooldowns"][key] = now
+    return True
+
+
+def _queue_for_osint_review(event_id: str, frame_bytes: bytes) -> None:
+    """
+    Background task: persist the triggering frame and mark it pending review.
+
+    Deliberately does NOT run a reverse-image search automatically. An unknown
+    visitor at the door hasn't consented to being searched across the public
+    web, so that step requires an explicit operator action — see
+    POST /osint/investigate/{event_id}. This task only makes the frame
+    available for that decision.
+    """
+    frame_path = PENDING_REVIEW_DIR / f"{event_id}.jpg"
+    frame_path.write_bytes(frame_bytes)
+    state["osint_queue"][event_id] = {
+        "event_id": event_id,
+        "status": "pending_review",
+        "timestamp": datetime.now().isoformat(),
+        "frame_path": str(frame_path),
+        "results": None,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Schemas
 # --------------------------------------------------------------------------- #
@@ -157,13 +201,49 @@ def health():
 # --------------------------------------------------------------------------- #
 @app.post("/recognize")
 async def recognize(file: UploadFile = File(...)):
-    """Detect + identify every face in an uploaded image."""
+    """Detect + identify every face in an uploaded image. Always logs."""
     img = await _read_image(file)
     results = engine().recognize(img)
 
     for r in results:
         event = "spoof_detected" if r.spoof else ("known" if r.is_known else "unknown")
         logger().log(event, r.name, r.is_known, r.confidence)
+
+    return {"count": len(results), "faces": [r.to_dict() for r in results]}
+
+
+@app.post("/detect")
+async def detect(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """
+    Lightweight detection for the live-feed overlay.
+
+    Meant to be polled frequently (roughly once a second) while the camera is
+    live, so unlike /recognize it does not log every single frame. Instead it
+    debounces: a known face logs at most once per cooldown window, and an
+    unknown *live* (non-spoofed) face schedules a background task that queues
+    the frame for optional, operator-triggered OSINT review.
+    """
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Could not decode image.")
+
+    results = engine().recognize(img)
+
+    for r in results:
+        if r.spoof:
+            if _cooldown_ready("spoof", KNOWN_LOG_COOLDOWN_SECONDS):
+                logger().log("spoof_detected", r.name, False, r.confidence)
+        elif r.is_known:
+            if _cooldown_ready(f"known:{r.name}", KNOWN_LOG_COOLDOWN_SECONDS):
+                logger().log("known", r.name, True, r.confidence)
+        else:
+            if r.is_live and _cooldown_ready("unknown", UNKNOWN_OSINT_COOLDOWN_SECONDS):
+                event = logger().log("unknown_detected", r.name, False, r.confidence, "Queued for OSINT review")
+                event_id = f"{event['date']}_{event['time'].replace(':', '')}_{uuid.uuid4().hex[:8]}"
+                background_tasks.add_task(_queue_for_osint_review, event_id, raw)
 
     return {"count": len(results), "faces": [r.to_dict() for r in results]}
 
@@ -202,6 +282,39 @@ def osint_search(req: SearchRequest):
     with OSINTScraper() as osint:
         hits = osint.web_search(req.query, max_results=req.max_results)
     return {"query": req.query, "count": len(hits), "results": [h.to_dict() for h in hits]}
+
+
+@app.get("/osint/queue")
+def osint_queue():
+    """Unknown-visitor frames queued by /detect, newest first."""
+    items = sorted(state["osint_queue"].values(), key=lambda e: e["timestamp"], reverse=True)
+    return {"count": len(items), "items": items}
+
+
+@app.post("/osint/investigate/{event_id}")
+def osint_investigate(event_id: str):
+    """
+    Explicitly run a reverse-image lookup for a queued unknown-visitor frame.
+
+    This is the one step in the pipeline that actually searches the public web
+    for a stranger's face, so it never fires automatically — the operator must
+    trigger it per event after reviewing the frame.
+    """
+    entry = state["osint_queue"].get(event_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"No queued event '{event_id}'.")
+
+    try:
+        with OSINTScraper() as osint:
+            hits = osint.reverse_image_search(entry["frame_path"])
+        entry["results"] = [h.to_dict() for h in hits]
+        entry["status"] = "completed"
+    except Exception as exc:
+        entry["status"] = "failed"
+        entry["results"] = []
+        raise HTTPException(status_code=502, detail=f"OSINT lookup failed: {exc}") from exc
+
+    return entry
 
 
 @app.post("/osint/reverse-image")

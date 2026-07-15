@@ -4,3 +4,7 @@ __pycache__/
 
 # Auto-downloaded MediaPipe Tasks model bundles (fetched on first run)
 /models/
+
+# Captured frames of unrecognized visitors, queued for optional OSINT review.
+# Biometric imagery of non-consenting people should never be committed.
+/family_data/pending_review/
