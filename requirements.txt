@@ -1,0 +1,10 @@
+# Secure-OSINT-FaceID — Python 3.11
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9      # required by FastAPI for file/form uploads
+opencv-python>=4.9
+mediapipe>=0.10
+numpy>=1.26
+scikit-learn>=1.4
+deepface>=0.0.90            # optional; enables the ArcFace recognition backend
+selenium>=4.18
