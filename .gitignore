@@ -1,3 +1,6 @@
 /venv
 __pycache__/
 *.pyc
+
+# Auto-downloaded MediaPipe Tasks model bundles (fetched on first run)
+/models/

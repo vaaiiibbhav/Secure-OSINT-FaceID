@@ -6,41 +6,84 @@ Isolated computer-vision layer for Secure-OSINT-FaceID.
 This module owns everything that touches pixels and knows nothing about the web
 server or the OSINT scraper. It exposes a single :class:`FacialEngine` that:
 
-  * detects faces (MediaPipe Face Detection),
+  * detects faces + extracts 3D landmarks (MediaPipe **Tasks** FaceLandmarker),
   * builds recognition embeddings (DeepFace / ArcFace, with a landmark fallback),
-  * checks 3D liveness to reject printed-photo spoofing (MediaPipe Face Mesh),
+  * checks 3D liveness to reject printed-photo spoofing,
   * persists a small "known faces" database to disk.
 
 Everything here operates on in-memory ``numpy`` BGR image arrays (OpenCV's native
 format). No camera capture, no windows, no HTTP — that lives in ``main.py``.
 
-Dependencies: opencv-python, mediapipe, numpy, scikit-learn, deepface (optional).
+MediaPipe API note
+------------------
+MediaPipe 0.10.x removed the legacy ``mp.solutions.*`` API (and there is no
+``mediapipe.python.solutions`` package either). This module uses the current
+**Tasks** API: :class:`mediapipe.tasks.python.vision.FaceLandmarker`, which is a
+single model that yields both the face region and the dense 3D landmark mesh.
+The ``.task`` model bundle is downloaded on first use and cached under ``models/``.
+
+Dependencies: opencv-python, mediapipe>=0.10, numpy, scikit-learn,
+deepface (optional but recommended; requires ``tf-keras`` alongside TensorFlow).
 """
 
 from __future__ import annotations
 
 import json
 import pickle
+import sys
+import urllib.request
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# DeepFace and MediaPipe emit emoji-laden log lines (e.g. "🔗 downloading ...").
+# Windows consoles default to cp1252 and raise UnicodeEncodeError on those
+# characters, which -- because DeepFace wraps *any* exception during weight
+# download as a generic failure -- silently breaks model loading. Force UTF-8 on
+# the standard streams so third-party (and our own) logging can never crash the
+# vision pipeline. Must run before importing DeepFace.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:  # pragma: no cover - non-reconfigurable stream
+        pass
+
 import cv2
 import numpy as np
 import mediapipe as mp
+from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.core.base_options import BaseOptions
 from sklearn.metrics.pairwise import cosine_similarity
 
 # DeepFace is heavy (pulls TensorFlow) and downloads model weights on first use.
 # Keep it optional so the engine still runs on a bare install using the
-# MediaPipe-landmark embedding fallback.
+# MediaPipe-landmark embedding fallback -- but make any import failure LOUD so we
+# never silently degrade recognition quality without the operator noticing.
+_DEEPFACE_AVAILABLE = False
+_DEEPFACE_IMPORT_ERROR: Optional[str] = None
 try:
     from deepface import DeepFace
 
     _DEEPFACE_AVAILABLE = True
-except Exception:  # pragma: no cover - depends on local install
+except Exception as _exc:  # pragma: no cover - depends on local install
     DeepFace = None
-    _DEEPFACE_AVAILABLE = False
+    _DEEPFACE_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
+    print(
+        "[FacialEngine] WARNING: DeepFace failed to import -- ArcFace recognition "
+        f"is unavailable and the engine will use the weaker 'landmarks' backend.\n"
+        f"              Reason: {_DEEPFACE_IMPORT_ERROR}\n"
+        "              Fix: `pip install tf-keras` (TensorFlow 2.16+ defaults to "
+        "Keras 3, which DeepFace/retinaface cannot use directly)."
+    )
+
+
+# Official MediaPipe model bundle for the Face Landmarker task.
+_FACE_LANDMARKER_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+_MODELS_DIR = Path(__file__).resolve().parent / "models"
 
 
 # --------------------------------------------------------------------------- #
@@ -97,10 +140,12 @@ class FacialEngine:
         Folder for the persisted database (``faces.pkl`` + ``faces_info.json``).
     backend:
         ``"deepface"`` (ArcFace embeddings, robust to pose/lighting) or
-        ``"landmarks"`` (468 MediaPipe mesh points, no model download).
+        ``"landmarks"`` (MediaPipe mesh geometry, no model download).
         Falls back to ``"landmarks"`` automatically if DeepFace is missing.
     model_name:
         DeepFace model when ``backend="deepface"``. ArcFace is a good default.
+    max_faces:
+        Maximum number of faces the landmarker will return per frame.
     """
 
     # Similarity thresholds are backend-specific because the embedding spaces
@@ -115,7 +160,9 @@ class FacialEngine:
         backend: str = "deepface",
         model_name: str = "ArcFace",
         recognition_threshold: Optional[float] = None,
-        liveness_min_depth: float = 0.05,
+        liveness_min_depth: float = 0.02,
+        max_faces: int = 5,
+        model_path: Optional[str] = None,
     ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -134,51 +181,77 @@ class FacialEngine:
 
         self.known_faces: list[KnownFace] = []
 
-        # MediaPipe primitives. Face detection localizes; face mesh gives the
-        # dense 3D landmarks used for liveness (and landmark-mode embeddings).
-        mp_fd = mp.solutions.face_detection
-        mp_fm = mp.solutions.face_mesh
-        self._face_detection = mp_fd.FaceDetection(model_selection=1, min_detection_confidence=0.5)
-        self._face_mesh = mp_fm.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=5,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
+        # MediaPipe Tasks FaceLandmarker: one model gives both the face region
+        # (derived from the landmark hull) and the dense 3D mesh used for
+        # liveness and, in landmark mode, the recognition embedding.
+        resolved_model = Path(model_path) if model_path else self._ensure_model()
+        options = vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(resolved_model)),
+            running_mode=vision.RunningMode.IMAGE,
+            num_faces=max_faces,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False,
         )
+        self._landmarker = vision.FaceLandmarker.create_from_options(options)
 
         self.load()
 
     # ------------------------------------------------------------------ #
-    # Low-level vision helpers
+    # Model management
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _ensure_model() -> Path:
+        """Return the local FaceLandmarker model path, downloading it if absent."""
+        _MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        dst = _MODELS_DIR / "face_landmarker.task"
+        if not dst.exists():
+            print(f"[FacialEngine] Downloading FaceLandmarker model -> {dst} ...")
+            urllib.request.urlretrieve(_FACE_LANDMARKER_URL, dst)
+            print(f"[FacialEngine] Model ready ({dst.stat().st_size} bytes).")
+        return dst
+
+    # ------------------------------------------------------------------ #
+    # Core inference (single landmarker pass shared by detect/mesh/recognize)
+    # ------------------------------------------------------------------ #
+    def _analyze(self, image: np.ndarray) -> list[dict]:
+        """
+        Run the landmarker once and return one entry per detected face:
+        ``{"bbox": (x, y, w, h), "landmarks": np.ndarray(shape=(N*3,))}``.
+        """
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+        result = self._landmarker.detect(mp_image)
+
+        h, w = image.shape[:2]
+        faces: list[dict] = []
+        if not result.face_landmarks:
+            return faces
+
+        for landmarks in result.face_landmarks:
+            xs = np.fromiter((lm.x for lm in landmarks), dtype=np.float32)
+            ys = np.fromiter((lm.y for lm in landmarks), dtype=np.float32)
+            flat = np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=np.float32).flatten()
+
+            x0 = max(0, int(xs.min() * w))
+            y0 = max(0, int(ys.min() * h))
+            x1 = min(w, int(xs.max() * w))
+            y1 = min(h, int(ys.max() * h))
+            faces.append({"bbox": (x0, y0, x1 - x0, y1 - y0), "landmarks": flat})
+        return faces
+
+    # ------------------------------------------------------------------ #
+    # Low-level vision helpers (public API preserved)
     # ------------------------------------------------------------------ #
     def detect_faces(self, image: np.ndarray) -> list[dict]:
         """Return bounding boxes for every detected face: ``{bbox, confidence}``."""
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self._face_detection.process(rgb)
-
-        faces: list[dict] = []
-        if results.detections:
-            h, w = image.shape[:2]
-            for det in results.detections:
-                box = det.location_data.relative_bounding_box
-                x = max(0, int(box.xmin * w))
-                y = max(0, int(box.ymin * h))
-                bw = int(box.width * w)
-                bh = int(box.height * h)
-                faces.append({"bbox": (x, y, bw, bh), "confidence": float(det.score[0])})
-        return faces
+        return [{"bbox": f["bbox"], "confidence": 1.0} for f in self._analyze(image)]
 
     def _mesh_landmarks(self, image: np.ndarray) -> list[np.ndarray]:
-        """Return one flat (468*3,) landmark array per detected face."""
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self._face_mesh.process(rgb)
-
-        out: list[np.ndarray] = []
-        if results.multi_face_landmarks:
-            for face in results.multi_face_landmarks:
-                pts = np.array([[lm.x, lm.y, lm.z] for lm in face.landmark], dtype=np.float32)
-                out.append(pts.flatten())
-        return out
+        """Return one flat ``(N*3,)`` landmark array per detected face."""
+        return [f["landmarks"] for f in self._analyze(image)]
 
     @staticmethod
     def _crop(image: np.ndarray, bbox: tuple[int, int, int, int], pad: float = 0.2) -> np.ndarray:
@@ -193,22 +266,27 @@ class FacialEngine:
     # ------------------------------------------------------------------ #
     # Embeddings
     # ------------------------------------------------------------------ #
-    def embed(self, image: np.ndarray, bbox: Optional[tuple[int, int, int, int]] = None) -> Optional[np.ndarray]:
+    def embed(
+        self,
+        image: np.ndarray,
+        bbox: Optional[tuple[int, int, int, int]] = None,
+        landmarks: Optional[np.ndarray] = None,
+    ) -> Optional[np.ndarray]:
         """
         Produce a single normalized embedding for the (optionally cropped) face.
 
         Uses DeepFace when the backend allows it; otherwise derives a geometric
-        embedding from the MediaPipe mesh. Returns ``None`` if no face is usable.
+        embedding from the MediaPipe mesh. ``landmarks`` may be supplied to reuse
+        an existing landmarker pass. Returns ``None`` if no face is usable.
         """
-        face_img = self._crop(image, bbox) if bbox is not None else image
-
         if self.backend == "deepface":
+            face_img = self._crop(image, bbox) if bbox is not None else image
             try:
                 reps = DeepFace.represent(
                     img_path=face_img,
                     model_name=self.model_name,
                     enforce_detection=False,
-                    detector_backend="skip" if bbox is not None else "opencv",
+                    detector_backend="skip",
                 )
                 if not reps:
                     return None
@@ -219,10 +297,13 @@ class FacialEngine:
                 return None
 
         # landmarks backend
-        meshes = self._mesh_landmarks(face_img)
-        if not meshes:
-            return None
-        return self._geometric_embedding(meshes[0])
+        if landmarks is None:
+            face_img = self._crop(image, bbox) if bbox is not None else image
+            meshes = self._mesh_landmarks(face_img)
+            if not meshes:
+                return None
+            landmarks = meshes[0]
+        return self._geometric_embedding(landmarks)
 
     @staticmethod
     def _geometric_embedding(flat_landmarks: np.ndarray) -> np.ndarray:
@@ -239,6 +320,11 @@ class FacialEngine:
     # ------------------------------------------------------------------ #
     # Liveness
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _depth_variance(flat_landmarks: np.ndarray) -> float:
+        z = flat_landmarks.reshape(-1, 3)[:, 2]
+        return float(np.ptp(z))
+
     def check_liveness(self, image: np.ndarray) -> bool:
         """
         Cheap 3D anti-spoof: a real face has meaningful Z-depth variance across
@@ -247,8 +333,7 @@ class FacialEngine:
         meshes = self._mesh_landmarks(image)
         if not meshes:
             return False
-        z = meshes[0].reshape(-1, 3)[:, 2]
-        return bool(np.ptp(z) > self.liveness_min_depth)
+        return self._depth_variance(meshes[0]) > self.liveness_min_depth
 
     # ------------------------------------------------------------------ #
     # Recognition
@@ -257,19 +342,21 @@ class FacialEngine:
         """
         Detect and identify every face in ``image``.
 
-        Updates detection bookkeeping for matched identities and flags spoofed
-        (non-live) matches instead of trusting them.
+        Runs the landmarker once, then for each face builds an embedding, checks
+        liveness from the same landmark set, and matches against the database.
+        Spoofed (non-live) matches are flagged instead of being trusted.
         """
-        detections = self.detect_faces(image)
+        faces = self._analyze(image)
         results: list[FaceResult] = []
 
-        for det in detections:
-            bbox = det["bbox"]
-            emb = self.embed(image, bbox)
+        for face in faces:
+            bbox = face["bbox"]
+            lm = face["landmarks"]
+            emb = self.embed(image, bbox=bbox, landmarks=lm)
             if emb is None:
                 continue
 
-            live = self.check_liveness(self._crop(image, bbox))
+            live = self._depth_variance(lm) > self.liveness_min_depth
 
             if not self.known_faces:
                 results.append(FaceResult("Unknown", False, 0.0, bbox, is_live=live))
@@ -306,13 +393,13 @@ class FacialEngine:
     # ------------------------------------------------------------------ #
     def add_face(self, name: str, image: np.ndarray, notes: str = "") -> bool:
         """Enroll a new identity from an image. Uses the largest detected face."""
-        detections = self.detect_faces(image)
-        if not detections:
+        faces = self._analyze(image)
+        if not faces:
             print(f"[FacialEngine] No face detected while enrolling '{name}'.")
             return False
 
-        largest = max(detections, key=lambda d: d["bbox"][2] * d["bbox"][3])
-        emb = self.embed(image, largest["bbox"])
+        largest = max(faces, key=lambda f: f["bbox"][2] * f["bbox"][3])
+        emb = self.embed(image, bbox=largest["bbox"], landmarks=largest["landmarks"])
         if emb is None:
             print(f"[FacialEngine] Could not build an embedding for '{name}'.")
             return False
@@ -423,5 +510,4 @@ class FacialEngine:
         return frame
 
     def close(self) -> None:
-        self._face_detection.close()
-        self._face_mesh.close()
+        self._landmarker.close()
