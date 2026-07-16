@@ -26,6 +26,7 @@ export interface FaceMember {
   added_date: string;
   total_detections: number;
   last_seen: string | null;
+  photo_url: string | null;
 }
 
 export interface FacesResponse {
@@ -44,6 +45,8 @@ export interface ActivityEvent {
   is_known: boolean;
   confidence: number;
   details: string;
+  event_id: string | null;
+  osint_status: string | null;
 }
 
 export interface LogsResponse {
@@ -61,7 +64,7 @@ export interface OSINTQueueItem {
   event_id: string;
   status: "pending_review" | "completed" | "failed";
   timestamp: string;
-  frame_path: string;
+  frame_url: string;
   results: OSINTHit[] | null;
 }
 
@@ -106,11 +109,16 @@ export const api = {
     return fetch(`${API_BASE}/health`).then((r) => handle(r));
   },
 
-  /** High-frequency polling endpoint for the live-feed overlay. Debounced server-side. */
-  detect(blob: Blob): Promise<DetectResponse> {
-    const form = new FormData();
-    form.append("file", blob, "frame.jpg");
-    return fetch(`${API_BASE}/detect`, { method: "POST", body: form }).then((r) => handle(r));
+  /**
+   * High-frequency polling endpoint for the live-feed overlay. Debounced
+   * server-side. Takes a base64-encoded JPEG frame (data-URL prefix optional).
+   */
+  detect(base64Image: string): Promise<DetectResponse> {
+    return fetch(`${API_BASE}/detect`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image: base64Image }),
+    }).then((r) => handle(r));
   },
 
   /** Full detect + always-logged recognition, used for explicit "verify" actions. */
@@ -129,11 +137,20 @@ export const api = {
     form.append("name", name);
     form.append("notes", notes);
     form.append("file", file, "enroll.jpg");
-    return fetch(`${API_BASE}/faces`, { method: "POST", body: form }).then((r) => handle(r));
+    return fetch(`${API_BASE}/enroll`, { method: "POST", body: form }).then((r) => handle(r));
   },
 
   removeFace(name: string): Promise<{ status: string; name: string }> {
     return fetch(`${API_BASE}/faces/${encodeURIComponent(name)}`, { method: "DELETE" }).then((r) => handle(r));
+  },
+
+  /** Runtime door-unlock matching strictness (0-1). No server restart needed. */
+  updateThreshold(threshold: number): Promise<{ threshold: number }> {
+    return fetch(`${API_BASE}/settings/threshold`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ threshold }),
+    }).then((r) => handle(r));
   },
 
   logs(count = 20): Promise<LogsResponse> {

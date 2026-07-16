@@ -11,7 +11,7 @@ import {
   ExternalLink,
   Info,
 } from "lucide-react";
-import { api, type ActivityEvent, type OSINTQueueItem } from "../lib/api";
+import { API_BASE, api, type ActivityEvent, type OSINTQueueItem } from "../lib/api";
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -32,13 +32,14 @@ function eventVisual(event: ActivityEvent) {
   }
 }
 
+const OSINT_STATUS_STYLES: Record<string, { text: string; cls: string }> = {
+  pending_review: { text: "PENDING REVIEW", cls: "text-status-pending bg-status-pending/10" },
+  completed: { text: "COMPLETED", cls: "text-status-known bg-status-known/10" },
+  failed: { text: "FAILED", cls: "text-status-spoof bg-status-spoof/10" },
+};
+
 function QueueStatusBadge({ status }: { status: OSINTQueueItem["status"] }) {
-  const map = {
-    pending_review: { text: "PENDING REVIEW", cls: "text-status-pending bg-status-pending/10" },
-    completed: { text: "COMPLETED", cls: "text-status-known bg-status-known/10" },
-    failed: { text: "FAILED", cls: "text-status-spoof bg-status-spoof/10" },
-  } as const;
-  const cfg = map[status];
+  const cfg = OSINT_STATUS_STYLES[status];
   return <span className={`rounded-full px-2 py-0.5 text-[10px] font-mono font-semibold ${cfg.cls}`}>{cfg.text}</span>;
 }
 
@@ -121,6 +122,15 @@ export function ActivityOsintPanel() {
                         {(event.confidence * 100).toFixed(1)}%
                       </span>
                     )}
+                    {event.osint_status && (
+                      <span
+                        className={`rounded px-1.5 py-0.5 font-mono ${
+                          OSINT_STATUS_STYLES[event.osint_status]?.cls ?? "bg-black/30 text-white/40"
+                        }`}
+                      >
+                        OSINT: {(OSINT_STATUS_STYLES[event.osint_status]?.text ?? event.osint_status.toUpperCase())}
+                      </span>
+                    )}
                   </div>
                 </div>
               </motion.div>
@@ -135,72 +145,82 @@ export function ActivityOsintPanel() {
         </div>
       </div>
 
-      {/* OSINT review queue */}
+      {/* Unknown visitor gallery + OSINT review queue */}
       <div className="rounded-2xl border border-white/10 bg-surface-1 p-4 shadow-xl">
         <h2 className="mb-1 flex items-center gap-2 text-sm font-bold tracking-wide text-white">
           <Search size={16} className="text-brand-400" />
-          OSINT REVIEW QUEUE
+          UNKNOWN VISITOR GALLERY
         </h2>
         <p className="mb-3 flex items-start gap-1.5 text-[11px] leading-relaxed text-white/35">
           <Info size={12} className="mt-0.5 shrink-0" />
-          Unknown visitors are queued automatically. Public web lookups only run when you explicitly investigate one.
+          Unknown visitors are queued automatically for review. Public web lookups only run when you explicitly
+          investigate one.
         </p>
 
-        <div className="flex max-h-[28rem] flex-col gap-2 overflow-y-auto pr-1">
+        <div className="grid max-h-[28rem] grid-cols-1 gap-3 overflow-y-auto pr-1 sm:grid-cols-2">
           {queue.map((item) => (
-            <div key={item.event_id} className="rounded-xl border border-white/10 bg-black/20 p-3">
-              <div className="flex items-center justify-between gap-2">
-                <span className="font-mono text-[11px] text-white/50">{item.timestamp.replace("T", " ").slice(0, 19)}</span>
-                <QueueStatusBadge status={item.status} />
-              </div>
-
-              {item.status === "pending_review" && (
-                <button
-                  onClick={() => investigate(item.event_id)}
-                  disabled={investigating.has(item.event_id)}
-                  className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-lg bg-brand-500/15 py-1.5 text-xs font-semibold text-brand-300 transition hover:bg-brand-500/25 disabled:opacity-50"
-                >
-                  {investigating.has(item.event_id) ? (
-                    <>
-                      <Loader2 size={12} className="animate-spin" /> Searching…
-                    </>
-                  ) : (
-                    <>
-                      <Search size={12} /> Investigate
-                    </>
-                  )}
-                </button>
-              )}
-
-              {investigateErrors[item.event_id] && (
-                <p className="mt-2 text-[11px] text-status-spoof">{investigateErrors[item.event_id]}</p>
-              )}
-
-              {item.status === "completed" && (
-                <div className="mt-2 flex flex-col gap-1.5">
-                  {item.results && item.results.length > 0 ? (
-                    item.results.slice(0, 5).map((hit, i) => (
-                      <a
-                        key={i}
-                        href={hit.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="flex items-center gap-1.5 truncate rounded-lg bg-white/5 px-2.5 py-1.5 text-[11px] text-white/60 transition hover:bg-white/10 hover:text-white"
-                      >
-                        <ExternalLink size={11} className="shrink-0 text-brand-400" />
-                        <span className="truncate">{hit.title}</span>
-                      </a>
-                    ))
-                  ) : (
-                    <p className="text-[11px] text-white/35">No public matches found.</p>
-                  )}
+            <div key={item.event_id} className="overflow-hidden rounded-xl border border-white/10 bg-black/20">
+              <img
+                src={`${API_BASE}${item.frame_url}`}
+                alt={`Unknown visitor at ${item.timestamp}`}
+                className="aspect-video w-full object-cover"
+              />
+              <div className="p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-mono text-[11px] text-white/50">
+                    {item.timestamp.replace("T", " ").slice(0, 19)}
+                  </span>
+                  <QueueStatusBadge status={item.status} />
                 </div>
-              )}
+
+                {item.status === "pending_review" && (
+                  <button
+                    onClick={() => investigate(item.event_id)}
+                    disabled={investigating.has(item.event_id)}
+                    className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-lg bg-brand-500/15 py-1.5 text-xs font-semibold text-brand-300 transition hover:bg-brand-500/25 disabled:opacity-50"
+                  >
+                    {investigating.has(item.event_id) ? (
+                      <>
+                        <Loader2 size={12} className="animate-spin" /> Searching…
+                      </>
+                    ) : (
+                      <>
+                        <Search size={12} /> Investigate
+                      </>
+                    )}
+                  </button>
+                )}
+
+                {investigateErrors[item.event_id] && (
+                  <p className="mt-2 text-[11px] text-status-spoof">{investigateErrors[item.event_id]}</p>
+                )}
+
+                {item.status === "completed" && (
+                  <div className="mt-2 flex flex-col gap-1.5">
+                    {item.results && item.results.length > 0 ? (
+                      item.results.slice(0, 5).map((hit, i) => (
+                        <a
+                          key={i}
+                          href={hit.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-1.5 truncate rounded-lg bg-white/5 px-2.5 py-1.5 text-[11px] text-white/60 transition hover:bg-white/10 hover:text-white"
+                        >
+                          <ExternalLink size={11} className="shrink-0 text-brand-400" />
+                          <span className="truncate">{hit.title}</span>
+                        </a>
+                      ))
+                    ) : (
+                      <p className="text-[11px] text-white/35">No public matches found.</p>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
           ))}
 
           {queue.length === 0 && (
-            <div className="rounded-xl border border-dashed border-white/10 py-10 text-center text-xs text-white/30">
+            <div className="col-span-full rounded-xl border border-dashed border-white/10 py-10 text-center text-xs text-white/30">
               No unknown visitors queued.
             </div>
           )}

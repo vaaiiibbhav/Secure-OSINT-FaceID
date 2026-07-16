@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Camera, CameraOff, ShieldAlert, ShieldCheck, ShieldQuestion, Radio } from "lucide-react";
+import { Camera, CameraOff, ShieldAlert, ShieldCheck, ShieldQuestion, Radio, Search, VideoOff } from "lucide-react";
 import { api, type FaceResult } from "../lib/api";
+import { primeAudio } from "../lib/sound";
 
-const POLL_INTERVAL_MS = 900;
-const JPEG_QUALITY = 0.82;
+const POLL_INTERVAL_MS = 200; // ~5 FPS
+const JPEG_QUALITY = 0.75; // base64/JSON has more overhead than multipart, keep frames lean
 
 type CameraState = "idle" | "requesting" | "active" | "denied" | "unavailable" | "error";
 
@@ -36,6 +37,7 @@ export function LiveCameraFeed({ onFaces }: LiveCameraFeedProps) {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const startCamera = useCallback(async () => {
+    primeAudio(); // user gesture -- unlocks autoplay policy for later sound cues
     setCameraState("requesting");
     setErrorMsg(null);
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -120,12 +122,12 @@ export function LiveCameraFeed({ onFaces }: LiveCameraFeedProps) {
         if (!ctx) return;
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-        const blob: Blob | null = await new Promise((resolve) =>
-          canvas.toBlob(resolve, "image/jpeg", JPEG_QUALITY),
-        );
-        if (!blob) return;
+        // toDataURL is synchronous, unlike toBlob -- keeps the 200ms capture
+        // loop simple. Already comes back "data:image/jpeg;base64,..." which
+        // the backend strips before decoding.
+        const dataUrl = canvas.toDataURL("image/jpeg", JPEG_QUALITY);
 
-        const res = await api.detect(blob);
+        const res = await api.detect(dataUrl);
         setFaces(res.faces);
         onFaces(res.faces);
       } catch {
@@ -139,6 +141,7 @@ export function LiveCameraFeed({ onFaces }: LiveCameraFeedProps) {
   }, [cameraState, onFaces]);
 
   const scale = nativeSize && displaySize.w ? displaySize.w / nativeSize.w : 1;
+  const hasQueuedUnknown = faces.some((f) => !f.is_known && f.is_live && !f.spoof);
 
   return (
     <div className="rounded-2xl border border-white/10 bg-surface-1 p-4 shadow-xl">
@@ -172,6 +175,20 @@ export function LiveCameraFeed({ onFaces }: LiveCameraFeedProps) {
             <div className="animate-scan-line absolute inset-x-0 h-px bg-gradient-to-r from-transparent via-brand-400/60 to-transparent" />
           </div>
         )}
+
+        <AnimatePresence>
+          {hasQueuedUnknown && (
+            <motion.div
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              className="absolute left-1/2 top-3 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-status-unknown/40 bg-black/80 px-3 py-1.5 text-[11px] font-mono font-semibold text-status-unknown backdrop-blur-sm"
+            >
+              <Search size={12} className="animate-pulse" />
+              UNKNOWN VISITOR — QUEUED FOR OSINT REVIEW
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         <AnimatePresence>
           {faces.map((face, idx) => {
@@ -209,8 +226,27 @@ export function LiveCameraFeed({ onFaces }: LiveCameraFeedProps) {
         </AnimatePresence>
 
         {cameraState !== "active" && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center">
-            <CameraOff size={32} className="text-white/25" />
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-[radial-gradient(circle_at_center,_rgba(6,182,212,0.06),_transparent_70%)] p-6 text-center">
+            <div className="relative flex h-16 w-16 items-center justify-center rounded-full border border-white/10 bg-white/5">
+              {cameraState === "requesting" ? (
+                <motion.div
+                  animate={{ rotate: 360 }}
+                  transition={{ duration: 1.1, repeat: Infinity, ease: "linear" }}
+                  className="absolute h-16 w-16 rounded-full border-2 border-transparent border-t-brand-400"
+                />
+              ) : (
+                <motion.div
+                  animate={{ opacity: [0.5, 1, 0.5] }}
+                  transition={{ duration: 2.2, repeat: Infinity, ease: "easeInOut" }}
+                  className="absolute inset-0 rounded-full border border-white/10"
+                />
+              )}
+              {cameraState === "denied" || cameraState === "unavailable" || cameraState === "error" ? (
+                <VideoOff size={26} className="text-status-spoof/70" />
+              ) : (
+                <CameraOff size={26} className="text-white/30" />
+              )}
+            </div>
             <p className="max-w-xs text-sm text-white/50">
               {cameraState === "requesting" && "Requesting camera access…"}
               {cameraState === "idle" && "Camera is off. Start the feed to begin live face verification."}

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Users, UserPlus, Trash2, X, Upload, Loader2, AlertCircle } from "lucide-react";
-import { api, ApiError, type FaceMember } from "../lib/api";
+import { Users, UserPlus, Trash2, X, Upload, Camera, Loader2, AlertCircle, RotateCcw } from "lucide-react";
+import { API_BASE, api, ApiError, type FaceMember } from "../lib/api";
 import { useEscapeKey } from "../hooks/useEscapeKey";
 
 const POLL_INTERVAL_MS = 5000;
@@ -69,9 +69,17 @@ export function ProfilesGrid() {
               <Trash2 size={14} />
             </button>
 
-            <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-lg bg-brand-500/15 font-mono text-sm font-bold text-brand-300">
-              {member.name.slice(0, 2).toUpperCase()}
-            </div>
+            {member.photo_url ? (
+              <img
+                src={`${API_BASE}${member.photo_url}`}
+                alt={member.name}
+                className="mb-2 h-10 w-10 rounded-lg object-cover"
+              />
+            ) : (
+              <div className="mb-2 flex h-10 w-10 items-center justify-center rounded-lg bg-brand-500/15 font-mono text-sm font-bold text-brand-300">
+                {member.name.slice(0, 2).toUpperCase()}
+              </div>
+            )}
             <h3 className="truncate pr-6 text-sm font-bold text-white">{member.name}</h3>
             {member.notes && <p className="mt-0.5 truncate text-xs text-white/40">{member.notes}</p>}
 
@@ -123,21 +131,87 @@ interface EnrollModalProps {
   onEnrolled: () => void;
 }
 
+type EnrollSource = "upload" | "webcam";
+
 function EnrollModal({ open, onClose, onEnrolled }: EnrollModalProps) {
   const [name, setName] = useState("");
   const [notes, setNotes] = useState("");
-  const [file, setFile] = useState<File | null>(null);
+  const [file, setFile] = useState<File | Blob | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [source, setSource] = useState<EnrollSource>("upload");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const webcamVideoRef = useRef<HTMLVideoElement>(null);
+  const webcamStreamRef = useRef<MediaStream | null>(null);
+  const [webcamActive, setWebcamActive] = useState(false);
+  const [webcamError, setWebcamError] = useState<string | null>(null);
+
   useEscapeKey(open && !submitting, onClose);
+
+  const setCapturedFile = useCallback((blob: File | Blob | null) => {
+    setFile(blob);
+    setPreviewUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return blob ? URL.createObjectURL(blob) : null;
+    });
+  }, []);
+
+  const stopWebcam = useCallback(() => {
+    webcamStreamRef.current?.getTracks().forEach((t) => t.stop());
+    webcamStreamRef.current = null;
+    setWebcamActive(false);
+  }, []);
+
+  const startWebcam = useCallback(async () => {
+    setWebcamError(null);
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setWebcamError("Camera access is unavailable in this browser.");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false });
+      webcamStreamRef.current = stream;
+      if (webcamVideoRef.current) {
+        webcamVideoRef.current.srcObject = stream;
+        await webcamVideoRef.current.play();
+      }
+      setWebcamActive(true);
+    } catch (err) {
+      setWebcamError(err instanceof Error ? err.message : "Could not access the camera.");
+    }
+  }, []);
+
+  // Only run the webcam while the modal is open, that tab is selected, and no
+  // photo has been captured yet -- and always release it on the way out.
+  useEffect(() => {
+    if (open && source === "webcam" && !previewUrl) {
+      startWebcam();
+    } else {
+      stopWebcam();
+    }
+    return () => stopWebcam();
+  }, [open, source, previewUrl, startWebcam, stopWebcam]);
+
+  const capturePhoto = () => {
+    const video = webcamVideoRef.current;
+    if (!video || !video.videoWidth) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob((blob) => setCapturedFile(blob), "image/jpeg", 0.92);
+  };
 
   const reset = () => {
     setName("");
     setNotes("");
-    setFile(null);
+    setCapturedFile(null);
     setError(null);
+    setSource("upload");
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -220,24 +294,88 @@ function EnrollModal({ open, onClose, onEnrolled }: EnrollModalProps) {
                 />
               </label>
 
-              <label className="text-xs font-medium text-white/60">
+              <div className="text-xs font-medium text-white/60">
                 Photo
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="mt-1 flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-white/15 bg-black/20 px-3 py-4 text-xs text-white/50 transition hover:border-brand-500/40 hover:text-white/80"
-                >
-                  <Upload size={14} />
-                  {file ? file.name : "Choose a clear, front-facing photo"}
-                </button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-                />
-              </label>
+                <div className="mt-1 flex gap-1 rounded-lg border border-white/10 bg-black/20 p-1">
+                  {(["upload", "webcam"] as const).map((tab) => (
+                    <button
+                      key={tab}
+                      type="button"
+                      onClick={() => {
+                        setSource(tab);
+                        setCapturedFile(null);
+                      }}
+                      className={`flex-1 rounded-md py-1.5 text-[11px] font-semibold transition ${
+                        source === tab ? "bg-brand-500/20 text-brand-300" : "text-white/40 hover:text-white/70"
+                      }`}
+                    >
+                      {tab === "upload" ? "Upload Photo" : "Capture from Webcam"}
+                    </button>
+                  ))}
+                </div>
+
+                {source === "upload" ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-white/15 bg-black/20 px-3 py-4 text-xs text-white/50 transition hover:border-brand-500/40 hover:text-white/80"
+                    >
+                      {previewUrl ? (
+                        <img src={previewUrl} alt="Selected" className="h-10 w-10 rounded object-cover" />
+                      ) : (
+                        <Upload size={14} />
+                      )}
+                      {file ? "Photo selected -- click to change" : "Choose a clear, front-facing photo"}
+                    </button>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={(e) => setCapturedFile(e.target.files?.[0] ?? null)}
+                    />
+                  </>
+                ) : (
+                  <div className="mt-2 overflow-hidden rounded-lg border border-white/10 bg-black">
+                    {previewUrl ? (
+                      <div className="relative">
+                        <img src={previewUrl} alt="Captured" className="aspect-video w-full object-cover" />
+                        <button
+                          type="button"
+                          onClick={() => setCapturedFile(null)}
+                          className="absolute bottom-2 right-2 flex items-center gap-1 rounded-full bg-black/70 px-2.5 py-1 text-[11px] font-semibold text-white/80 backdrop-blur-sm hover:text-white"
+                        >
+                          <RotateCcw size={11} /> Retake
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="relative aspect-video w-full">
+                        <video
+                          ref={webcamVideoRef}
+                          muted
+                          playsInline
+                          className={`h-full w-full object-cover ${webcamActive ? "opacity-100" : "opacity-0"}`}
+                        />
+                        {!webcamActive && (
+                          <div className="absolute inset-0 flex items-center justify-center px-4 text-center text-[11px] text-white/40">
+                            {webcamError ?? "Starting camera…"}
+                          </div>
+                        )}
+                        {webcamActive && (
+                          <button
+                            type="button"
+                            onClick={capturePhoto}
+                            className="absolute bottom-2 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full bg-brand-500 px-4 py-1.5 text-xs font-semibold text-surface-0 shadow-lg"
+                          >
+                            <Camera size={13} /> Capture
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
 
               {error && (
                 <p className="flex items-start gap-1.5 text-xs text-status-spoof">

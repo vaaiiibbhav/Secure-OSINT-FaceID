@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import pickle
+import re
 import sys
 import urllib.request
 from dataclasses import dataclass, field, asdict
@@ -152,7 +153,7 @@ class FacialEngine:
     # are completely different. ArcFace cosine similarity for a genuine match is
     # typically well above ~0.40; raw face-mesh geometry sits much higher because
     # all human faces are structurally similar, hence the strict 0.96.
-    _DEFAULT_THRESHOLDS = {"deepface": 0.40, "landmarks": 0.96}
+    _DEFAULT_THRESHOLDS = {"deepface": 0.65, "landmarks": 0.96}
 
     def __init__(
         self,
@@ -410,9 +411,32 @@ class FacialEngine:
             return False
 
         self.known_faces.append(KnownFace(name=name, embedding=emb, backend=self.backend, notes=notes))
+        self._save_photo(name, image)
         self.save()
         print(f"[FacialEngine] Enrolled '{name}' ({len(self.known_faces)} total).")
         return True
+
+    @staticmethod
+    def _safe_dirname(name: str) -> str:
+        """Sanitize an identity name for safe use as a filesystem path component."""
+        cleaned = re.sub(r"[^\w\-. ]", "_", name).strip().strip(".")
+        return cleaned or "unnamed"
+
+    def _save_photo(self, name: str, image: np.ndarray) -> Path:
+        """Persist the enrollment photo under ``data_dir/<name>/`` for later review."""
+        photo_dir = self.data_dir / self._safe_dirname(name)
+        photo_dir.mkdir(parents=True, exist_ok=True)
+        photo_path = photo_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+        cv2.imwrite(str(photo_path), image)
+        return photo_path
+
+    def latest_photo_path(self, name: str) -> Optional[Path]:
+        """Most recently enrolled photo on disk for ``name``, if any."""
+        photo_dir = self.data_dir / self._safe_dirname(name)
+        if not photo_dir.exists():
+            return None
+        photos = sorted(photo_dir.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return photos[0] if photos else None
 
     def remove_face(self, name: str) -> bool:
         """Remove every identity matching ``name`` (case-insensitive)."""
