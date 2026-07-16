@@ -7,9 +7,16 @@ This module owns everything that touches pixels and knows nothing about the web
 server or the OSINT scraper. It exposes a single :class:`FacialEngine` that:
 
   * detects faces + extracts 3D landmarks (MediaPipe **Tasks** FaceLandmarker),
-  * builds recognition embeddings (DeepFace / ArcFace, with a landmark fallback),
+  * crops and eye-aligns each face before feature extraction,
+  * builds recognition embeddings (DeepFace / ArcFace 512-D, L2-normalized,
+    with a landmark-geometry fallback),
   * checks 3D liveness to reject printed-photo spoofing,
   * persists a small "known faces" database to disk.
+
+Recognition uses cosine similarity on L2-normalized embeddings; the default
+match threshold is 0.65 (equivalently a cosine *distance* of 0.35). Every
+comparison's similarity score is logged to stdout so identity boundaries can be
+calibrated from real footage.
 
 Everything here operates on in-memory ``numpy`` BGR image arrays (OpenCV's native
 format). No camera capture, no windows, no HTTP — that lives in ``main.py``.
@@ -147,13 +154,22 @@ class FacialEngine:
         DeepFace model when ``backend="deepface"``. ArcFace is a good default.
     max_faces:
         Maximum number of faces the landmarker will return per frame.
+    log_scores:
+        When True (default) every recognition comparison prints the cosine
+        similarity of the top matches to stdout, for calibrating the threshold.
     """
 
     # Similarity thresholds are backend-specific because the embedding spaces
-    # are completely different. ArcFace cosine similarity for a genuine match is
-    # typically well above ~0.40; raw face-mesh geometry sits much higher because
-    # all human faces are structurally similar, hence the strict 0.96.
+    # are completely different. For ArcFace on L2-normalized embeddings, a
+    # cosine similarity of 0.65 (== cosine distance 0.35) is a solid default
+    # unlock boundary. Raw face-mesh geometry sits much higher because all human
+    # faces are structurally similar, hence the strict 0.96.
     _DEFAULT_THRESHOLDS = {"deepface": 0.65, "landmarks": 0.96}
+
+    # Canonical FaceMesh eye-corner indices, present in every >=468-point
+    # landmarker output. Used to level the inter-ocular line before cropping.
+    _EYE_A = (33, 133)   # one eye: (outer, inner) corner
+    _EYE_B = (263, 362)  # other eye: (outer, inner) corner
 
     def __init__(
         self,
@@ -164,6 +180,7 @@ class FacialEngine:
         liveness_min_depth: float = 0.02,
         max_faces: int = 5,
         model_path: Optional[str] = None,
+        log_scores: bool = True,
     ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -179,6 +196,7 @@ class FacialEngine:
             else self._DEFAULT_THRESHOLDS[backend]
         )
         self.liveness_min_depth = liveness_min_depth
+        self.log_scores = log_scores
 
         self.known_faces: list[KnownFace] = []
 
@@ -264,6 +282,49 @@ class FacialEngine:
         x1, y1 = min(w, x + bw + px), min(h, y + bh + py)
         return image[y0:y1, x0:x1]
 
+    def _align_crop(
+        self,
+        image: np.ndarray,
+        bbox: tuple[int, int, int, int],
+        landmarks: np.ndarray,
+        pad: float = 0.25,
+    ) -> np.ndarray:
+        """
+        Rotate the face so the inter-ocular line is horizontal, then crop.
+
+        In-plane head tilt is the single biggest nuisance variable for an
+        ArcFace crop -- leveling the eyes before embedding materially improves
+        match consistency across frames. Falls back to a plain padded crop if
+        the eye landmarks are missing or degenerate.
+        """
+        pts = landmarks.reshape(-1, 3)
+        if pts.shape[0] <= max(self._EYE_A[1], self._EYE_B[1]):
+            return self._crop(image, bbox, pad)
+
+        h, w = image.shape[:2]
+        eye_a = (
+            (pts[self._EYE_A[0], 0] + pts[self._EYE_A[1], 0]) * 0.5 * w,
+            (pts[self._EYE_A[0], 1] + pts[self._EYE_A[1], 1]) * 0.5 * h,
+        )
+        eye_b = (
+            (pts[self._EYE_B[0], 0] + pts[self._EYE_B[1], 0]) * 0.5 * w,
+            (pts[self._EYE_B[0], 1] + pts[self._EYE_B[1], 1]) * 0.5 * h,
+        )
+        dx, dy = eye_b[0] - eye_a[0], eye_b[1] - eye_a[1]
+        if dx == 0 and dy == 0:
+            return self._crop(image, bbox, pad)
+
+        # angle = atan2(dy, dx) makes the rotated eye vector horizontal under
+        # OpenCV's (x-right, y-down) convention; rotate about the eye midpoint
+        # so the face stays put within the padded bbox.
+        angle = float(np.degrees(np.arctan2(dy, dx)))
+        eyes_center = ((eye_a[0] + eye_b[0]) * 0.5, (eye_a[1] + eye_b[1]) * 0.5)
+        rot = cv2.getRotationMatrix2D(eyes_center, angle, 1.0)
+        aligned = cv2.warpAffine(
+            image, rot, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+        )
+        return self._crop(aligned, bbox, pad)
+
     # ------------------------------------------------------------------ #
     # Embeddings
     # ------------------------------------------------------------------ #
@@ -278,25 +339,42 @@ class FacialEngine:
 
         Uses DeepFace when the backend allows it; otherwise derives a geometric
         embedding from the MediaPipe mesh. ``landmarks`` may be supplied to reuse
-        an existing landmarker pass. Returns ``None`` if no face is usable.
+        an existing landmarker pass and, in DeepFace mode, to eye-align the crop.
+        Returns an L2-normalized vector, or ``None`` if no face is usable.
         """
         if self.backend == "deepface":
-            face_img = self._crop(image, bbox) if bbox is not None else image
+            if bbox is not None and landmarks is not None:
+                face_img = self._align_crop(image, bbox, landmarks)
+            elif bbox is not None:
+                face_img = self._crop(image, bbox)
+            else:
+                face_img = image
             try:
                 reps = DeepFace.represent(
                     img_path=face_img,
                     model_name=self.model_name,
-                    # We already located the face via MediaPipe (detector_backend
-                    # "skip" tells DeepFace not to re-detect), but doorbell-angle
-                    # crops are often partial/off-axis. enforce_detection=False
-                    # keeps DeepFace from raising on those instead of crashing
-                    # the whole /detect request over one bad frame.
+                    # We already located + aligned the face via MediaPipe
+                    # (detector_backend "skip" tells DeepFace not to re-detect),
+                    # but doorbell-angle crops are often partial/off-axis.
+                    # enforce_detection=False keeps DeepFace from raising on those
+                    # instead of crashing the whole /detect request over one bad
+                    # frame.
                     enforce_detection=False,
                     detector_backend="skip",
                 )
                 if not reps:
                     return None
                 vec = np.asarray(reps[0]["embedding"], dtype=np.float32)
+                # ArcFace produces a 512-D vector; anything else means a
+                # different model is loaded and the 0.65 threshold won't apply.
+                if vec.size != 512:
+                    print(
+                        f"[FacialEngine] WARNING: expected a 512-D ArcFace embedding "
+                        f"but got {vec.size}-D (model_name={self.model_name!r}); "
+                        "the default cosine threshold may not be valid."
+                    )
+                # L2-normalize so cosine similarity == dot product and relates to
+                # Euclidean distance as d^2 = 2(1 - cos).
                 return self._l2(vec)
             except Exception as exc:  # pragma: no cover
                 print(f"[FacialEngine] DeepFace embed failed: {exc}")
@@ -344,6 +422,25 @@ class FacialEngine:
     # ------------------------------------------------------------------ #
     # Recognition
     # ------------------------------------------------------------------ #
+    def _log_similarity(self, sims: list[float], best_sim: float) -> None:
+        """
+        Print the top cosine-similarity scores for one face to stdout.
+
+        Shows the best few (name=score) pairs plus the match decision against
+        the current threshold, so identity boundaries can be calibrated from
+        real footage. Cosine *distance* is ``1 - similarity``.
+        """
+        order = list(np.argsort(sims)[::-1])[:3]
+        ranked = "  ".join(f"{self.known_faces[i].name}={sims[i]:.4f}" for i in order)
+        decision = "MATCH" if best_sim >= self.recognition_threshold else "no-match"
+        # flush=True so the score is visible immediately for live calibration --
+        # under a server, stdout is block-buffered and would otherwise lag.
+        print(
+            f"[FacialEngine] cosine-sim (thr={self.recognition_threshold:.3f}, "
+            f"dist_thr={1.0 - self.recognition_threshold:.3f}) {ranked} -> {decision}",
+            flush=True,
+        )
+
     def recognize(self, image: np.ndarray) -> list[FaceResult]:
         """
         Detect and identify every face in ``image``.
@@ -374,6 +471,9 @@ class FacialEngine:
             ]
             best_idx = int(np.argmax(sims))
             best_sim = sims[best_idx]
+
+            if self.log_scores:
+                self._log_similarity(sims, best_sim)
 
             if best_sim >= self.recognition_threshold:
                 kf = self.known_faces[best_idx]
