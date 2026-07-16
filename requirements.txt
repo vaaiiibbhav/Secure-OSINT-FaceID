@@ -7,4 +7,6 @@ mediapipe>=0.10
 numpy>=1.26
 scikit-learn>=1.4
 deepface>=0.0.90            # optional; enables the ArcFace recognition backend
+tf-keras>=2.16             # required by DeepFace: TensorFlow 2.16+ ships Keras 3,
+                           # but DeepFace/retinaface need the Keras 2 API (tf_keras)
 selenium>=4.18

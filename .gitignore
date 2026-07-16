@@ -1,3 +1,15 @@
 /venv
 __pycache__/
 *.pyc
+
+# Auto-downloaded MediaPipe Tasks model bundles (fetched on first run)
+/models/
+
+# Locally generated biometric data: face embeddings, per-member enrollment
+# photos (family_data/<name>/), and unknown-visitor snapshots
+# (family_data/unknown/). Keep every generated subdirectory out of git except
+# the small fixtures already tracked from before this refactor.
+/family_data/*/
+!/family_data/logs/
+/family_data/faces.pkl
+/family_data/faces_info.json
