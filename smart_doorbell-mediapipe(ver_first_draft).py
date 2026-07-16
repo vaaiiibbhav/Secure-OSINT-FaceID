@@ -1,4 +1,22 @@
 """
+================================================================================
+ SUPERSEDED DRAFT -- NOT PART OF THE RUNNING APPLICATION
+================================================================================
+This is the original single-file prototype, kept only for history. It predates
+the facial_engine.py / scraper.py / main.py split and still calls the legacy
+`mp.solutions.face_detection` API, which newer MediaPipe releases (0.10.x+)
+removed entirely -- running this file directly will raise:
+
+    AttributeError: module 'mediapipe' has no attribute 'solutions'
+
+That is expected for this file and is NOT a bug in the current app. The actual
+backend already migrated to the modern MediaPipe Tasks API in facial_engine.py
+and does not have this problem. To run the real application:
+
+    uvicorn main:app --reload --port 8000
+
+================================================================================
+
 SMART DOORBELL SYSTEM - MEDIAPIPE VERSION
 Privacy-First Family Recognition System
 
